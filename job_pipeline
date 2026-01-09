@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+"""
+SmartRecruiters Full Pipeline — harvest (Common Crawl) + verify + download + load
+
+Stages:
+  1) harvest  -> Discover org slugs from Common Crawl (careers.smartrecruiters.com/*)
+  2) verify   -> Check which slugs work via SmartRecruiters postings API
+  3) download -> Fetch all postings JSON for each verified org
+  4) load     -> Upsert into Postgres (same schema you already use), mark stale as closed
+  5) all      -> Run the whole thing
+
+Usage examples:
+  python smartrecruiters_full_pipeline.py harvest --latest 12
+  python smartrecruiters_full_pipeline.py verify --concurrency 32
+  python smartrecruiters_full_pipeline.py download --workers 24
+  python smartrecruiters_full_pipeline.py load --dsn "dbname=<redacted> user=<redacted> host=<redacted>"
+  python smartrecruiters_full_pipeline.py all --latest 12 --workers 24 --dsn "dbname=<redacted> user=<redacted> host=<redacted>"
+
+Install (in your venv):
+  pip install requests "psycopg[binary]" tqdm beautifulsoup4 lxml
+"""
+
+from __future__ import annotations
+import argparse, csv, json, os, re, sys, time, pathlib
+from typing import Iterable, List, Dict, Set, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup
+from tqdm import tqdm
+import psycopg
+
+# ---------------- Paths & Config ----------------
+DATA_DIR = pathlib.Path("data")
+RAW_DIR  = DATA_DIR / "sr_jobs_raw"
+CAND_TXT = DATA_DIR / "sr_candidate_orgs.txt"
+VER_TXT  = DATA_DIR / "sr_verified_orgs.txt"
+VER_CSV  = DATA_DIR / "sr_verified_orgs.csv"
+
+DEFAULT_DSN       = os.environ.get("DB_DSN", "dbname=jobs user=<redacted> host=<redacted>")
+DEFAULT_WORKERS   = int(os.environ.get("SRP_WORKERS", "24"))
+DEFAULT_TIMEOUT   = int(os.environ.get("SRP_TIMEOUT", "20"))
+DEFAULT_LATEST_N  = int(os.environ.get("SRP_LATEST",  "12"))  # latest-N CC collections
+DEFAULT_CDX_PAUSE = float(os.environ.get("SRP_CDX_PAUSE", "0.15"))
+
+# ---------------- Common Crawl CDX ----------------
+CDX_BASE  = "https://index.commoncrawl.org"
+COLLINFO  = f"{CDX_BASE}/collinfo.json"
+SR_HOSTS = [
+    "careers.smartrecruiters.com",
+    "www.smartrecruiters.com",  # sometimes org pages here too
+]
+
+def make_session(timeout=20, total=6, backoff=0.7) -> requests.Session:
+    s = requests.Session()
+    retries = Retry(
+        total=total,
+        backoff_factor=backoff,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    s.mount("http://", HTTPAdapter(max_retries=retries))
+    s.request_timeout = timeout
+    s.headers.update({"User-Agent": "job-harvester/1.0"})
+    return s
+
+def get_collections(session: requests.Session) -> List[Dict]:
+    r = session.get(COLLINFO, timeout=session.request_timeout)
+    r.raise_for_status()
+    return r.json()
+
+def pick_latest_collections(colls: List[Dict], n: int) -> List[str]:
+    ids = sorted([c.get("id","") for c in colls if c.get("id")], key=lambda x: x)
+    return ids[-n:] if n > 0 else ids[-12:]
+
+def cdx_iter(session: requests.Session, coll_id: str, params: Dict[str, str]) -> Iterable[str]:
+    base = f"{CDX_BASE}/{coll_id}-index"
+    with session.get(base, params=params, timeout=session.request_timeout, stream=True) as resp:
+        if resp.status_code == 404:
+            return
+        resp.raise_for_status()
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                url = obj.get("url")
+                if url:
+                    yield url
+            except json.JSONDecodeError:
+                continue
+
+# careers.smartrecruiters.com/<OrgName>/...
+ORG_RE = re.compile(r"careers\.smartrecruiters\.com/([^/?#]+)/?")
+def extract_org(url: str) -> Optional[str]:
+    m = ORG_RE.search(url)
+    if not m:
+        return None
+    org = m.group(1).strip()
+    # normalize: SmartRecruiters org tokens are case-sensitive in paths, but API uses the same token
+    # we will keep original case, but dedupe by lower-compare.
+    if any(org.lower().startswith(x) for x in ["search","jobs","job","static","sitemap"]):
+        return None
+    return org
+
+# ---------------- HTML → text ----------------
+_SPACES = re.compile(r"\s+")
+def html_to_text(html_blob: Optional[str]) -> Optional[str]:
+    if not html_blob:
+        return None
+    soup = BeautifulSoup(html_blob, "lxml")
+    for t in soup(["script", "style"]):
+        t.decompose()
+    for br in soup.find_all("br"):
+        br.replace_with("\n")
+    for li in soup.find_all("li"):
+        li.insert_before(" • ")
+        li.append("\n")
+    txt = soup.get_text("\n", strip=True)
+    txt = _SPACES.sub(" ", txt)
+    txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
+    return txt
+
+def to_text_array(items, key_candidates=("name","label","text")) -> List[str]:
+    if not items:
+        return []
+    if isinstance(items, dict):
+        items = [items]
+    out = []
+    for it in items:
+        if isinstance(it, dict):
+            for k in key_candidates:
+                v = it.get(k)
+                if v:
+                    out.append(str(v))
+                    break
+        elif isinstance(it, str):
+            out.append(it)
+    return out
+
+def infer_work_model_from_text(text: str) -> str:
+    t = (text or "").lower()
+    r = any(k in t for k in ["remote", "work from home", "wfh", "anywhere"])
+    o = any(k in t for k in ["onsite", "on-site", "on site"])
+    if r and o: return "hybrid"
+    if r: return "remote"
+    if o: return "onsite"
+    return "unknown"
+
+# ---------------- Harvest ----------------
+def step_harvest(latest:int=DEFAULT_LATEST_N, cdx_pause:float=DEFAULT_CDX_PAUSE) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+
+    s = make_session(timeout=20)
+    print("Fetching Common Crawl collections...")
+    colls = get_collections(s)
+    chosen_ids = pick_latest_collections(colls, latest)
+    print("Collections:", ", ".join(chosen_ids))
+
+    found: Dict[str, str] = {}  # lower -> original (keep first seen casing)
+    for cid in chosen_ids:
+        print(f"\nCDX scan: {cid}")
+        for host in SR_HOSTS:
+            params = {"url": f"{host}/*", "matchType":"domain", "output":"json", "fl":"url", "gzip":"false"}
+            try:
+                n = 0
+                for url in cdx_iter(s, cid, params):
+                    n += 1
+                    org = extract_org(url)
+                    if org:
+                        key = org.lower()
+                        if key not in found:
+                            found[key] = org
+                print(f"  [{cid}] urls for {host}: ~{n}")
+            except Exception as e:
+                print(f"  [{cid}] CDX error for {host}: {e} — skip")
+            time.sleep(cdx_pause)
+
+    if not found:
+        print("No candidates discovered.")
+        return
+
+    # write one per line, original casing preserved
+    CAND_TXT.write_text("\n".join(sorted(found.values(), key=lambda x:x.lower() )), encoding="utf-8")
+    print(f"Candidates: {len(found)} → {CAND_TXT}")
+
+# ---------------- Verify ----------------
+def sr_postings_page(session: requests.Session, org: str, limit:int=1, offset:int=0, timeout:int=15):
+    # Public postings list: https://api.smartrecruiters.com/v1/companies/<org>/postings?limit=100&offset=0
+    url = f"https://api.smartrecruiters.com/v1/companies/{org}/postings"
+    params = {"limit": limit, "offset": offset}
+    return session.get(url, params=params, timeout=timeout)
+
+def verify_org(session: requests.Session, org: str, timeout:int=15) -> Tuple[str, bool, int]:
+    try:
+        r = sr_postings_page(session, org, limit=1, offset=0, timeout=timeout)
+        if r.status_code == 200:
+            try:
+                obj = r.json()
+                # responses usually have 'totalFound' and 'content' array
+                total = int(obj.get("totalFound", 0))
+                return org, True, total
+            except Exception:
+                return org, True, -1
+        elif r.status_code in (404, 410):
+            return org, False, -1
+        return org, False, -1
+    except Exception:
+        return org, False, -1
+
+def read_orgs_for_verify() -> List[str]:
+    if CAND_TXT.exists():
+        return [ln.strip() for ln in CAND_TXT.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    raise RuntimeError(f"No candidate orgs at {CAND_TXT}. Run 'harvest' first.")
+
+def step_verify(concurrency:int=24, timeout:int=15) -> None:
+    orgs = read_orgs_for_verify()
+    if not orgs:
+        print("No orgs to verify.")
+        return
+
+    s = make_session(timeout=timeout)
+    ok_rows = []
+    print(f"Verifying {len(orgs)} SmartRecruiters org candidates...")
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futs = [ex.submit(verify_org, s, o, timeout) for o in orgs]
+        for fut in tqdm(as_completed(futs), total=len(futs), desc="verify"):
+            org, ok, cnt = fut.result()
+            if ok:
+                ok_rows.append((org, "ok", cnt))
+
+    if not ok_rows:
+        print("No verified orgs.")
+        return
+
+    VER_TXT.write_text("\n".join(sorted([r[0] for r in ok_rows], key=lambda x:x.lower() )), encoding="utf-8")
+    with VER_CSV.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["org","status","job_count"])
+        for r in sorted(ok_rows):
+            w.writerow(r)
+
+    print(f"✅ Verified {len(ok_rows)} orgs → {VER_TXT} / {VER_CSV}")
+
+# ---------------- Download all postings per org ----------------
+def read_verified_orgs() -> List[str]:
+    if VER_TXT.exists():
+        return [ln.strip() for ln in VER_TXT.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    if VER_CSV.exists():
+        out = []
+        with VER_CSV.open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if (row.get("status") or "").strip().lower() == "ok":
+                    out.append(row["org"].strip())
+        if out:
+            VER_TXT.write_text("\n".join(sorted(out, key=lambda x:x.lower() )), encoding="utf-8")
+            return out
+    raise RuntimeError("No verified org list found. Run 'verify' first.")
+
+def fetch_org_all_postings(org: str, timeout:int=20, page_size:int=100) -> Tuple[str, int]:
+    """
+    Pull all postings via pagination and save a combined JSON array:
+      data/sr_jobs_raw/<org>.json
+    """
+    s = make_session(timeout=timeout)
+    posts = []
+    offset = 0
+    while True:
+        r = sr_postings_page(s, org, limit=page_size, offset=offset, timeout=timeout)
+        if r.status_code != 200:
+            break
+        try:
+            obj = r.json()
+        except Exception:
+            break
+        chunk = obj.get("content") or []
+        posts.extend(chunk)
+        total = int(obj.get("totalFound", len(posts)))
+        offset += len(chunk)
+        if not chunk or offset >= total:
+            break
+
+    # Save raw postings array (might be empty)
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    (RAW_DIR / f"{org}.json").write_text(json.dumps(posts), encoding="utf-8")
+    return org, len(posts)
+
+def step_download(workers:int=DEFAULT_WORKERS, timeout:int=DEFAULT_TIMEOUT, limit:Optional[int]=None) -> None:
+    orgs = read_verified_orgs()
+    if limit:
+        orgs = orgs[:limit]
+    print(f"Downloading SmartRecruiters postings for {len(orgs)} orgs → {RAW_DIR} ...")
+    ok = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(fetch_org_all_postings, org, timeout, 100) for org in orgs]
+        for fut in tqdm(as_completed(futs), total=len(futs), desc="download"):
+            org, n = fut.result()
+            if n >= 0:
+                ok += 1
+    print(f"✅ Saved JSON for {ok} orgs to {RAW_DIR}.")
+
+# ---------------- Load into Postgres ----------------
+def step_load(dsn:str=DEFAULT_DSN) -> None:
+    files = list(RAW_DIR.glob("*.json"))
+    print(f"Loading {len(files)} org files into Postgres…")
+
+    conn = psycopg.connect(dsn)
+    try:
+        insert_sql = """
+        INSERT INTO jobs (
+          source, company_slug, job_id, title, departments, locations,
+          employment_type, work_model, updated_at_api, created_at_api,
+          apply_url, description_html, description_text, raw, status
+        )
+        VALUES (
+          'smartrecruiters', %s, %s, %s, %s, %s,
+          %s, %s, %s, %s,
+          %s, %s, %s, %s::jsonb, 'active'
+        )
+        ON CONFLICT (source, company_slug, job_id) DO UPDATE SET
+          title=EXCLUDED.title,
+          departments=EXCLUDED.departments,
+          locations=EXCLUDED.locations,
+          employment_type=EXCLUDED.employment_type,
+          work_model=EXCLUDED.work_model,
+          updated_at_api=EXCLUDED.updated_at_api,
+          apply_url=EXCLUDED.apply_url,
+          description_html=EXCLUDED.description_html,
+          description_text=EXCLUDED.description_text,
+          raw=EXCLUDED.raw,
+          status='active';
+        """
+
+        # Helper: flatten a posting to our columns
+        def parse_posting(org: str, p: dict):
+            # ID: SmartRecruiters postings typically have 'id'
+            jid = str(p.get("id") or "")
+            # Title
+            title = p.get("name") or p.get("jobTitle") or p.get("title")
+            # Depts / functions
+            departments = []
+            if isinstance(p.get("department"), dict):
+                departments = to_text_array([p["department"]], key_candidates=("label","name"))
+            elif isinstance(p.get("function"), dict):
+                departments = to_text_array([p["function"]], key_candidates=("label","name"))
+
+            # Location(s)
+            locs = []
+            loc_obj = p.get("location") or {}
+            # Build a readable string like "City, Region, Country"
+            parts = []
+            for k in ("city","region","country"):
+                v = loc_obj.get(k)
+                if v: parts.append(str(v))
+            loc_str = ", ".join(parts) if parts else None
+            if loc_str:
+                locs = [loc_str]
+
+            # Description HTML: SmartRecruiters ‘jobAd’ often has sections [{title, text(html)}]
+            desc_html = ""
+            jobad = p.get("jobAd") or {}
+            if isinstance(jobad, dict):
+                secs = jobad.get("sections") or []
+                if isinstance(secs, list):
+                    chunks = []
+                    for s in secs:
+                        t = (s.get("text") or "").strip()
+                        if t:
+                            chunks.append(t)
+                    desc_html = "\n\n".join(chunks)
+                # fallback single html
+                if not desc_html:
+                    desc_html = (jobad.get("jobDescription") or jobad.get("additionalInformation") or "") or ""
+            desc_text = html_to_text(desc_html)
+
+            # Work model heuristic
+            wm = infer_work_model_from_text(" ".join([title or "", desc_text or ""]))
+
+            # Timestamps (not always present in list payload; could be fetched per-posting detail
+            updated_at = p.get("target") or None  # placeholder; SR often omits in list view
+            created_at = p.get("releasedDate") or None
+
+            # Apply URL
+            apply_url = p.get("applyUrl") or p.get("ref") or p.get("externalApplyLink") or ""
+
+            raw = json.dumps(p)
+            return (org, jid, title, departments, locs, None, wm, updated_at, created_at,
+                    apply_url, desc_html, desc_text, raw)
+
+        with conn, conn.cursor() as cur:
+            for path in tqdm(files, desc="load"):
+                org = path.stem
+                try:
+                    postings = json.loads(path.read_text(encoding="utf-8"))
+                    if not isinstance(postings, list):
+                        postings = []
+                except Exception:
+                    postings = []
+
+                current_ids: Set[str] = set()
+                for p in postings:
+                    jid = str(p.get("id") or "")
+                    if not jid:
+                        continue
+                    current_ids.add(jid)
+                    row = parse_posting(org, p)
+                    cur.execute(insert_sql, row)
+
+                # Mark stale as closed (only if we saw this org’s live postings)
+                if postings:
+                    # avoid empty ANY() by giving a dummy value that will never match
+                    safe_ids = list(current_ids) if current_ids else ["__none__"]
+                    cur.execute("""
+                      UPDATE jobs
+                         SET status = 'closed'
+                       WHERE source = 'smartrecruiters'
+                         AND company_slug = %s
+                         AND status <> 'closed'
+                         AND NOT (job_id = ANY(%s::text[]))
+                    """, (org, safe_ids))
+
+              
+        print("✅ Jobs upserted and stale marked closed.")
+    finally:
+        conn.close()
+
+# ---------------- CLI ----------------
+def main():
+    ap = argparse.ArgumentParser(description="SmartRecruiters full pipeline.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sp_h = sub.add_parser("harvest", help="Discover org slugs via Common Crawl")
+    sp_h.add_argument("--latest", type=int, default=DEFAULT_LATEST_N, help="Use last N CC collections (default 12)")
+    sp_h.add_argument("--cdx-pause", type=float, default=DEFAULT_CDX_PAUSE, help="Sleep between CDX host calls (sec)")
+
+    sp_v = sub.add_parser("verify", help="Verify candidate orgs against SR postings API")
+    sp_v.add_argument("--concurrency", type=int, default=24)
+    sp_v.add_argument("--timeout", type=int, default=15)
+
+    sp_d = sub.add_parser("download", help="Download all postings JSON for verified orgs")
+    sp_d.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    sp_d.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    sp_d.add_argument("--limit",   type=int, default=None)
+
+    sp_l = sub.add_parser("load", help="Upsert into Postgres and mark stale as closed")
+    sp_l.add_argument("--dsn", type=str, default=DEFAULT_DSN)
+
+    sp_a = sub.add_parser("all", help="Run harvest + verify + download + load")
+    sp_a.add_argument("--latest", type=int, default=DEFAULT_LATEST_N)
+    sp_a.add_argument("--cdx-pause", type=float, default=DEFAULT_CDX_PAUSE)
+    sp_a.add_argument("--concurrency", type=int, default=24)
+    sp_a.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    sp_a.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    sp_a.add_argument("--limit",   type=int, default=None)
+    sp_a.add_argument("--dsn",     type=str, default=DEFAULT_DSN)
+
+    args = ap.parse_args()
+
+    if args.cmd == "harvest":
+        step_harvest(latest=args.latest, cdx_pause=args.cdx_pause)
+    elif args.cmd == "verify":
+        step_verify(concurrency=args.concurrency, timeout=args.timeout)
+    elif args.cmd == "download":
+        step_download(workers=args.workers, timeout=args.timeout, limit=args.limit)
+    elif args.cmd == "load":
+        step_load(dsn=args.dsn)
+    elif args.cmd == "all":
+        step_harvest(latest=args.latest, cdx_pause=args.cdx_pause)
+        step_verify(concurrency=args.concurrency, timeout=args.timeout)
+        step_download(workers=args.workers, timeout=args.timeout, limit=args.limit)
+        step_load(dsn=args.dsn)
+
+if __name__ == "__main__":
+    main()
